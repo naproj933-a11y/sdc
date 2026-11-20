@@ -6,23 +6,44 @@ import joblib
 import numpy as np
 import pandas as pd
 from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, create_model
 
 BASE = Path(__file__).resolve().parent
-DATA = BASE / 'data'
+# Support the repository layout where trained model files are inside ./SDC.
+MODEL_DIR = BASE / 'SDC' if (BASE / 'SDC').is_dir() else BASE
+DATA = BASE / 'data' if (BASE / 'data').is_dir() else (BASE / 'SDC' / 'data')
 CLASS_NAMES = {0: 'Good / Satisfactory / Moderate', 1: 'Poor', 2: 'Very Poor', 3: 'Severe'}
-M1 = joblib.load(BASE / 'M1_PM25_Regression.joblib')
-M2 = joblib.load(BASE / 'M2_Delhi_Classification.joblib')
-M4 = joblib.load(BASE / 'M4_Station_Clustering.joblib')
+M1 = joblib.load(MODEL_DIR / 'M1_PM25_Regression.joblib')
+M2 = joblib.load(MODEL_DIR / 'M2_Delhi_Classification.joblib')
+M4 = joblib.load(MODEL_DIR / 'M4_Station_Clustering.joblib')
 M1_FEATURES = list(M1['features'])
 M2_FEATURES = list(M2.feature_names_in_)
 M4_FEATURES = list(M4.feature_names_in_)
 app = FastAPI(title='SDC Air Quality Model Testing API', version='1.0.0', description='Individual, combined and random historical-day testing for M1, M2 and M4.')
 
+def _feature_input_model(model_name: str, feature_names: list[str], required: set[str] | None = None):
+    """Build an explicit Swagger schema from the loaded model's real feature names."""
+    required = required or set()
+    fields = {}
+    for feature in feature_names:
+        if feature in required:
+            fields[feature] = (float, Field(..., description='Required model input feature'))
+        else:
+            # null means the model's trained imputer can supply its learned median.
+            fields[feature] = (float | None, Field(default=None, description='Leave null to use the trained model imputer'))
+    return create_model(model_name, **fields)
+
+
+M1FeatureInput = _feature_input_model('M1FeatureInput', M1_FEATURES, {'pm25_lag0'})
+M2FeatureInput = _feature_input_model('M2FeatureInput', M2_FEATURES)
+
+
 class M1Input(BaseModel):
-    features: dict[str, float | None] = Field(..., description='M1 engineered feature values. Required: pm25_lag0.')
+    features: M1FeatureInput
+
 class M2Input(BaseModel):
-    features: dict[str, float | None] = Field(..., description='M2 engineered daily feature values (88 features).')
+    features: M2FeatureInput
+
 class M4Input(BaseModel):
     stations: list[dict[str, Any]] = Field(..., description='Station rows with Station Name and four M4 feature columns.')
 
@@ -154,11 +175,15 @@ def schemas(): return {'M1_features':M1_FEATURES,'M2_features':M2_FEATURES,'M4_f
 
 @app.post('/test/m1')
 def test_m1(body:M1Input):
-    try: return {'model':'M1_PM25_Regression','input':body.features,'output':_predict_m1(body.features)}
+    try:
+        values = body.features.model_dump()
+        return {'model':'M1_PM25_Regression','input':values,'output':_predict_m1(values)}
     except Exception as e: raise HTTPException(400,str(e))
 @app.post('/test/m2')
 def test_m2(body:M2Input):
-    try: return {'model':'M2_Delhi_Classification','input':body.features,'output':_predict_m2(body.features)}
+    try:
+        values = body.features.model_dump()
+        return {'model':'M2_Delhi_Classification','input':values,'output':_predict_m2(values)}
     except Exception as e: raise HTTPException(400,str(e))
 @app.post('/test/m4')
 def test_m4(body:M4Input):
