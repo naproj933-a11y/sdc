@@ -241,12 +241,18 @@ def _predict_m2(values):
     return result
 
 @app.get('/')
-def root(): return {'project':'SDC','api':'SDC Air Quality Model Testing API','docs':'/docs','modes':['combined','random-day','live-date-prediction']}
+def root(): return {'project':'SDC','api':'SDC Air Quality Model Testing API','docs':'/docs','modes':['individual','combined','random-day','live-date-prediction']}
 @app.get('/health')
 def health(): return {'status':'ok','models_loaded':['M1_PM25_Regression','M2_Delhi_Classification','M4_Station_Clustering'],'feature_counts':{'M1':len(M1_FEATURES),'M2':len(M2_FEATURES),'M4':len(M4_FEATURES)}}
 @app.get('/schemas')
 def schemas(): return {'M1_features':M1_FEATURES,'M2_features':M2_FEATURES,'M4_features':M4_FEATURES}
 
+@app.post('/test/m1')
+def test_m1(body:M1Input):
+    try:
+        values = body.features.model_dump()
+        return {'model':'M1_PM25_Regression','input':values,'output':_predict_m1(values)}
+    except Exception as e: raise HTTPException(400,str(e))
 @app.post('/test/m2')
 def test_m2(body:M2Input):
     try:
@@ -537,7 +543,7 @@ def _build_live_feature_rows(days: dict, target_day: Date) -> tuple[dict, dict, 
     return m1, m2, daily
 
 
-@app.post('/predict/live')
+@app.post('/predict/live',include_in_schema=False)
 def predict_live(body: LivePredictionInput):
     """Predict Delhi's selected date using live/forecast inputs from Open-Meteo."""
     try:
