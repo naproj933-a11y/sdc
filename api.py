@@ -21,33 +21,6 @@ M2_FEATURES = list(M2.feature_names_in_)
 M4_FEATURES = list(M4.feature_names_in_)
 app = FastAPI(title='SDC Air Quality Model Testing API', version='1.0.0', description='Individual, combined and random historical-day testing for M1, M2 and M4.')
 
-def _feature_input_model(model_name: str, feature_names: list[str], required: set[str] | None = None):
-    """Build an explicit Swagger schema from the loaded model's real feature names."""
-    required = required or set()
-    fields = {}
-    for feature in feature_names:
-        if feature in required:
-            fields[feature] = (float, Field(..., description='Required model input feature'))
-        else:
-            # null means the model's trained imputer can supply its learned median.
-            fields[feature] = (float | None, Field(default=None, description='Leave null to use the trained model imputer'))
-    return create_model(model_name, **fields)
-
-
-M1FeatureInput = _feature_input_model('M1FeatureInput', M1_FEATURES, {'pm25_lag0'})
-M2FeatureInput = _feature_input_model('M2FeatureInput', M2_FEATURES)
-
-
-class M1Input(BaseModel):
-    features: M1FeatureInput
-
-class M2Input(BaseModel):
-    features: M2FeatureInput
-
-class M4Input(BaseModel):
-    stations: list[dict[str, Any]] = Field(..., description='Station rows with Station Name and four M4 feature columns.')
-
-
 def _daily_m2():
     fire = pd.read_csv(DATA/'Layer1_Fire_Augmented.csv', parse_dates=['acq_date'])
     weather = pd.read_csv(DATA/'Layer2_Weather_Regional_4Zones.csv', parse_dates=['time'])
@@ -146,6 +119,107 @@ def _m4_features():
     return pd.DataFrame(rows).sort_values('Station ID').reset_index(drop=True)
 
 
+
+def _plain_value(value):
+    """Convert pandas/numpy values into JSON/Pydantic-friendly Python values."""
+    if value is None or pd.isna(value):
+        return None
+    if isinstance(value, (np.integer,)):
+        return int(value)
+    if isinstance(value, (np.floating,)):
+        return float(value)
+    if isinstance(value, (np.bool_,)):
+        return bool(value)
+    return value
+
+
+def _feature_input_model(model_name: str, feature_names: list[str], defaults: dict):
+    """Create explicit Swagger fields with defaults from the latest saved CSV row."""
+    fields = {}
+    for feature in feature_names:
+        value = _plain_value(defaults.get(feature))
+        fields[feature] = (
+            float | None,
+            Field(default=value, description='Latest available saved CSV value; editable')
+        )
+    return create_model(model_name, **fields)
+
+
+def _load_latest_csv_defaults():
+    """Build the most recent usable M1/M2 rows and current M4 station profiles."""
+    d1 = _m1_frame()
+    valid1 = d1.dropna(subset=['pm25_lag0'])
+    if valid1.empty:
+        m1_defaults = {}
+    else:
+        m1_defaults = {
+            feature: _plain_value(valid1.iloc[-1].get(feature))
+            for feature in M1_FEATURES
+        }
+
+    d2 = _daily_m2()
+    valid2 = d2.dropna(subset=['pm25'])
+    if valid2.empty:
+        m2_defaults = {}
+    else:
+        m2_defaults = {
+            feature: _plain_value(valid2.iloc[-1].get(feature))
+            for feature in M2_FEATURES
+        }
+
+    station_frame = _m4_features()
+    m4_defaults = []
+    for _, row in station_frame.iterrows():
+        item = {
+            'station_name': str(row.get('Station Name', '')),
+        }
+        for feature in M4_FEATURES:
+            item[feature] = _plain_value(row.get(feature))
+        m4_defaults.append(item)
+
+    return m1_defaults, m2_defaults, m4_defaults
+
+
+# These defaults are loaded from the latest available saved CSV data when the API starts.
+# They are displayed in Swagger and can be edited before submitting each endpoint.
+try:
+    _M1_DEFAULTS, _M2_DEFAULTS, _M4_DEFAULT_STATIONS = _load_latest_csv_defaults()
+except Exception as exc:
+    warnings.warn(f'Could not load latest CSV defaults for Swagger: {exc}')
+    _M1_DEFAULTS, _M2_DEFAULTS, _M4_DEFAULT_STATIONS = {}, {}, []
+
+M1FeatureInput = _feature_input_model('M1FeatureInput', M1_FEATURES, _M1_DEFAULTS)
+M2FeatureInput = _feature_input_model('M2FeatureInput', M2_FEATURES, _M2_DEFAULTS)
+
+_m4_station_fields = {
+    'station_name': (str | None, Field(default=None, description='Station name')),
+}
+for _feature in M4_FEATURES:
+    _m4_station_fields[_feature] = (
+        float | None,
+        Field(
+            default=_plain_value(_M4_DEFAULT_STATIONS[0].get(_feature)) if _M4_DEFAULT_STATIONS else None,
+            description='Latest saved station-profile value; editable'
+        )
+    )
+M4StationInput = create_model('M4StationInput', **_m4_station_fields)
+
+
+class M1Input(BaseModel):
+    features: M1FeatureInput = Field(default=M1FeatureInput())
+
+
+class M2Input(BaseModel):
+    features: M2FeatureInput = Field(default=M2FeatureInput())
+
+
+class M4Input(BaseModel):
+    stations: list[M4StationInput] = Field(
+        default=_M4_DEFAULT_STATIONS,
+        description='Latest saved station-profile feature values from the CSV; editable'
+    )
+
+
 def _predict_m1(values):
     row=pd.DataFrame([values]).reindex(columns=M1_FEATURES)
     if pd.isna(row['pm25_lag0'].iloc[0]): raise ValueError('pm25_lag0 (today PM2.5) is required')
@@ -188,12 +262,29 @@ def test_m2(body:M2Input):
 @app.post('/test/m4')
 def test_m4(body:M4Input):
     try:
-        frame=pd.DataFrame(body.stations); missing=[c for c in M4_FEATURES if c not in frame]
-        if missing: raise ValueError('Missing M4 feature columns: '+', '.join(missing))
-        if frame[M4_FEATURES].isna().any().any(): raise ValueError('M4 feature values cannot be missing')
-        labels=M4.predict(frame[M4_FEATURES]); out=[]
-        for i,label in enumerate(labels): out.append({'station_name':frame.iloc[i].get('Station Name',f'Station {i+1}'),'cluster':int(label)})
-        return {'model':'M4_Station_Clustering','input':body.stations,'output':{'station_assignments':out}}
+        station_rows = []
+        for station in body.stations:
+            item = station.model_dump()
+            item['Station Name'] = item.pop('station_name', None)
+            station_rows.append(item)
+        frame = pd.DataFrame(station_rows)
+        missing = [c for c in M4_FEATURES if c not in frame]
+        if missing:
+            raise ValueError('Missing M4 feature columns: ' + ', '.join(missing))
+        if frame[M4_FEATURES].isna().any().any():
+            raise ValueError('M4 feature values cannot be missing')
+        labels = M4.predict(frame[M4_FEATURES])
+        out = []
+        for i, label in enumerate(labels):
+            out.append({
+                'station_name': frame.iloc[i].get('Station Name') or f'Station {i+1}',
+                'cluster': int(label)
+            })
+        return {
+            'model': 'M4_Station_Clustering',
+            'input': station_rows,
+            'output': {'station_assignments': out}
+        }
     except Exception as e: raise HTTPException(400,str(e))
 
 @app.post('/test/combined')
