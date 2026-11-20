@@ -241,18 +241,12 @@ def _predict_m2(values):
     return result
 
 @app.get('/')
-def root(): return {'project':'SDC','api':'SDC Air Quality Model Testing API','docs':'/docs','modes':['individual','combined','random-day','live-date-prediction']}
+def root(): return {'project':'SDC','api':'SDC Air Quality Model Testing API','docs':'/docs','modes':['combined','random-day','live-date-prediction']}
 @app.get('/health')
 def health(): return {'status':'ok','models_loaded':['M1_PM25_Regression','M2_Delhi_Classification','M4_Station_Clustering'],'feature_counts':{'M1':len(M1_FEATURES),'M2':len(M2_FEATURES),'M4':len(M4_FEATURES)}}
 @app.get('/schemas')
 def schemas(): return {'M1_features':M1_FEATURES,'M2_features':M2_FEATURES,'M4_features':M4_FEATURES}
 
-@app.post('/test/m1')
-def test_m1(body:M1Input):
-    try:
-        values = body.features.model_dump()
-        return {'model':'M1_PM25_Regression','input':values,'output':_predict_m1(values)}
-    except Exception as e: raise HTTPException(400,str(e))
 @app.post('/test/m2')
 def test_m2(body:M2Input):
     try:
@@ -542,5 +536,68 @@ def _build_live_feature_rows(days: dict, target_day: Date) -> tuple[dict, dict, 
         m1.setdefault(feature, None)
     return m1, m2, daily
 
+
+@app.post('/predict/live')
+def predict_live(body: LivePredictionInput):
+    """Predict Delhi's selected date using live/forecast inputs from Open-Meteo."""
+    try:
+        today = datetime.now(ZoneInfo('Asia/Kolkata')).date()
+        if body.date < today - Timedelta(days=1) or body.date > today + Timedelta(days=4):
+            raise ValueError(f'Date must be between {(today-Timedelta(days=1)).isoformat()} and {(today+Timedelta(days=4)).isoformat()} (Delhi local forecast window).')
+        target = body.date
+        days = _fetch_live_delhi_days(target - Timedelta(days=1), target)
+        m1_values, m2_values, daily = _build_live_feature_rows(days, target)
+        m1_result = _predict_m1(m1_values)
+        m2_result = _predict_m2(m2_values)
+        # M4 is a static station-profile model, not a date-specific forecast.
+        station_frame = _m4_features()
+        station_labels = M4.predict(station_frame[M4_FEATURES])
+        station_clusters = [
+            {'station_name': row['Station Name'], 'cluster': int(station_labels[i])}
+            for i, (_, row) in enumerate(station_frame.iterrows())
+        ]
+        target_weather = daily.get(target, {})
+        return {
+            'mode': 'live-date-prediction', 'location': 'Delhi, India',
+            'requested_date': target.isoformat(), 'input_date': (target-Timedelta(days=1)).isoformat(),
+            'M1': {'prediction_for': target.isoformat(), 'output': m1_result},
+            'M2': {'prediction_for': target.isoformat(), 'output': m2_result},
+            'weather_for_requested_date': {
+                'temperature_2m_c': target_weather.get('temperature_2m'),
+                'relative_humidity_percent': target_weather.get('relative_humidity_2m'),
+                'dew_point_c': target_weather.get('dew_point_2m'),
+                'apparent_temperature_c': target_weather.get('apparent_temperature'),
+                'wind_speed_10m_kmh': target_weather.get('wind_speed_10m'),
+                'wind_direction_10m_degrees': target_weather.get('wind_direction_10m'),
+                'wind_gusts_10m_kmh': target_weather.get('wind_gusts_10m_max'),
+                'precipitation_total_mm': target_weather.get('precipitation_sum'),
+                'cloud_cover_percent': target_weather.get('cloud_cover'),
+                'pressure_hpa': target_weather.get('pressure_msl'),
+                'boundary_layer_height_m': target_weather.get('boundary_layer_height'),
+                'wind_speed_100m_kmh': target_weather.get('wind_speed_100m'),
+                'shortwave_radiation_w_m2': target_weather.get('shortwave_radiation'),
+                'visibility_km': (target_weather.get('visibility') / 1000.0) if target_weather.get('visibility') is not None else None,
+            },
+            'air_quality_model_estimates_for_requested_date': {
+                'pm25_ug_m3': target_weather.get('pm2_5'),
+                'pm10_ug_m3': target_weather.get('pm10'),
+                'carbon_monoxide_ug_m3': target_weather.get('carbon_monoxide'),
+                'nitrogen_dioxide_ug_m3': target_weather.get('nitrogen_dioxide'),
+                'sulphur_dioxide_ug_m3': target_weather.get('sulphur_dioxide'),
+                'ozone_ug_m3': target_weather.get('ozone'),
+            },
+            'zone_inputs_for_requested_date': {
+                zone: {'weather': values['weather'], 'air_quality': values['air']}
+                for zone, values in days.get(target, {}).items()
+            },
+            'M4': {'profile_basis': 'historical station profiles; not a daily prediction', 'station_profile_clusters': station_clusters},
+            'data_source': 'Open-Meteo weather forecast and CAMS air-quality model estimates for four Delhi zone coordinates; not CPCB station observations.',
+            'limitations': [
+                'The trained models were fitted on historical CPCB/weather/fire datasets. Open-Meteo CAMS inputs have a different source and spatial resolution, so live predictions are experimental and require validation.',
+                'Unavailable pollutants, Punjab upwind-wind features and fire features are left missing and handled by the trained model imputer; see the missing-feature lists.',
+                'M1 predicts next-day PM2.5 from the previous day inputs plus requested-day forecast weather. M2 predicts the requested-day category from previous-day features.',
+                'M4 assigns historical station-profile clusters and does not forecast daily air quality.'
+            ]
+        }
     except Exception as e:
         raise HTTPException(400, str(e))
